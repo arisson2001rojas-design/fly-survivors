@@ -1,4 +1,4 @@
-"""Leaky integrate-and-fire whole-brain model on the GPU (PyTorch).
+"""Leaky integrate-and-fire whole-brain model on the GPU (PyTorch + Triton).
 
 Reimplements the Brian2 model of Shiu et al. 2024 with a fixed time step:
 
@@ -6,12 +6,18 @@ Reimplements the Brian2 model of Shiu et al. 2024 with a fixed time step:
     dg/dt = -g / tau_syn                  (frozen while refractory)
     spike when v > v_th  ->  v = v_reset, g = 0, refractory for t_refr
     presynaptic spike    ->  g_post += w_syn * signed_synapse_count, after a delay
+                             (dropped if the postsynaptic neuron is refractory)
 
 "Optogenetic" activation of a neuron set is modelled as Poisson spiking at a fixed rate
 (the neuron is forced above threshold, with no refractory period), like the reference.
 
-All state lives on the device; :meth:`LIFBrain.step` has no host-side control flow so it
-can be captured in a CUDA graph for real-time use.
+Two backends with identical semantics:
+
+- ``torch``: plain tensor ops and a CSR sparse mat-vec. Works on CPU; the reference.
+- ``triton``: event-driven propagation + fused update kernels (see kernels.py). Faster.
+
+Neither has host-side control flow inside :meth:`LIFBrain.step`, so a whole step can be
+captured in a CUDA graph and replayed for real-time use.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import numpy as np
 import torch
 
 from .connectome import Connectome
+from .kernels import HAS_TRITON
 
 
 @dataclass
@@ -49,6 +56,8 @@ class LIFBrain:
         Model constants.
     device:
         ``"cuda"`` or ``"cpu"``.
+    backend:
+        ``"auto"`` (triton when available on CUDA, else torch), ``"triton"`` or ``"torch"``.
     """
 
     def __init__(
@@ -56,17 +65,38 @@ class LIFBrain:
         cn: Connectome,
         params: LIFParams | None = None,
         device: str | torch.device = "cuda",
+        backend: str = "auto",
     ) -> None:
         self.p = params or LIFParams()
         self.device = torch.device(device)
         self.n = cn.n_neurons
         p = self.p
 
-        # Weight matrix W[post, pre] so that g_inc = W @ spikes.
-        idx = torch.from_numpy(np.stack([cn.post.astype(np.int64), cn.pre.astype(np.int64)]))
-        val = torch.from_numpy(cn.weight * np.float32(p.w_syn))
-        w = torch.sparse_coo_tensor(idx, val, (self.n, self.n)).coalesce()
-        self.W = w.to_sparse_csr().to(self.device)
+        triton_ok = HAS_TRITON and self.device.type == "cuda"
+        if backend == "auto":
+            backend = "triton" if triton_ok else "torch"
+        if backend == "triton" and not triton_ok:
+            raise RuntimeError("triton backend needs Triton and a CUDA device")
+        if backend not in ("triton", "torch"):
+            raise ValueError(f"unknown backend {backend!r}")
+        self.backend = backend
+
+        weight_mv = cn.weight * np.float32(p.w_syn)
+        if backend == "triton":
+            # CSR by presynaptic neuron for event-driven propagation.
+            order = np.argsort(cn.pre, kind="stable")
+            pre_s = cn.pre[order].astype(np.int64)
+            rowptr = np.zeros(self.n + 1, dtype=np.int32)
+            np.cumsum(np.bincount(pre_s, minlength=self.n), out=rowptr[1:])
+            self.rowptr = torch.from_numpy(rowptr).to(self.device)
+            self.col = torch.from_numpy(cn.post[order].astype(np.int32)).to(self.device)
+            self.val = torch.from_numpy(weight_mv[order].astype(np.float32)).to(self.device)
+        else:
+            # W[post, pre] so that g_inc = W @ spikes.
+            idx = torch.from_numpy(np.stack([cn.post.astype(np.int64), cn.pre.astype(np.int64)]))
+            val = torch.from_numpy(weight_mv.astype(np.float32))
+            w = torch.sparse_coo_tensor(idx, val, (self.n, self.n)).coalesce()
+            self.W = w.to_sparse_csr().to(self.device)
 
         self.decay_m = math.exp(-p.dt / p.tau_m)
         self.decay_s = math.exp(-p.dt / p.tau_syn)
@@ -75,17 +105,20 @@ class LIFBrain:
         self.hist_len = self.delay_steps + 1
 
         f32 = dict(dtype=torch.float32, device=self.device)
+        i32 = dict(dtype=torch.int32, device=self.device)
         self.v = torch.full((self.n,), p.v_rest, **f32)
         self.g = torch.zeros(self.n, **f32)
-        self.refr = torch.zeros(self.n, dtype=torch.int32, device=self.device)
+        self.g_inc = torch.zeros(self.n, **f32)
+        self.refr = torch.zeros(self.n, **i32)
         # Per-neuron refractory length (0 for Poisson-driven neurons, like the reference).
-        self.refr_len = torch.full((self.n,), self.refr_steps, dtype=torch.int32, device=self.device)
+        self.refr_len = torch.full((self.n,), self.refr_steps, **i32)
         # Probability of a forced spike per step for Poisson-driven neurons.
         self.stim_prob = torch.zeros(self.n, **f32)
-        # Ring buffer of past spike vectors for the synaptic delay.
+        # Ring buffer of past spike rows for the synaptic delay; hist_pos = row of this step.
         self.hist = torch.zeros(self.hist_len, self.n, **f32)
         self.hist_pos = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.spikes = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        self.spikes = torch.zeros(self.n, **f32)  # 1.0 where the neuron spiked this step
+        self.seed = torch.zeros((), **i32)
         self.t_step = 0
         self._graph: torch.cuda.CUDAGraph | None = None
 
@@ -93,6 +126,7 @@ class LIFBrain:
     def reset(self) -> None:
         self.v.fill_(self.p.v_rest)
         self.g.zero_()
+        self.g_inc.zero_()
         self.refr.zero_()
         self.hist.zero_()
         self.hist_pos.zero_()
@@ -110,19 +144,21 @@ class LIFBrain:
         self.refr_len.fill_(self.refr_steps)
 
     # ------------------------------------------------------------------- step
-    def _step_impl(self) -> None:
+    def _step_torch(self) -> None:
         p = self.p
+        self.hist_pos.copy_(torch.remainder(self.hist_pos + 1, self.hist_len))
         active = self.refr == 0
 
         # Delayed presynaptic spikes arrive now.
-        read_pos = torch.remainder(self.hist_pos + 1 - self.delay_steps, self.hist_len)
-        s_del = self.hist.index_select(0, read_pos.view(1)).view(-1)
+        read_row = torch.remainder(self.hist_pos - self.delay_steps, self.hist_len)
+        s_del = self.hist.index_select(0, read_row.view(1)).view(-1)
         g_inc = torch.mv(self.W, s_del)
 
         # Integrate (exact exponential decay of g; g held constant within the step for v).
         g_new = self.g * self.decay_s
         v_new = p.v_rest + g_new + (self.v - p.v_rest - g_new) * self.decay_m
-        g_int = torch.where(active, g_new, self.g) + g_inc
+        # Refractory neurons are frozen and drop incoming input, as in the Brian2 reference.
+        g_int = torch.where(active, g_new + g_inc, self.g)
         v_int = torch.where(active, v_new, self.v)
 
         # Poisson drive: force the neuron above threshold.
@@ -134,12 +170,57 @@ class LIFBrain:
         self.g.copy_(torch.where(spikes, torch.zeros_like(g_int), g_int))
         self.refr.copy_(torch.where(spikes, self.refr_len, torch.clamp(self.refr - 1, min=0)))
 
-        self.hist_pos.copy_(torch.remainder(self.hist_pos + 1, self.hist_len))
-        self.hist.index_copy_(0, self.hist_pos.view(1), spikes.to(torch.float32).view(1, -1))
         self.spikes.copy_(spikes)
+        self.hist.index_copy_(0, self.hist_pos.view(1), self.spikes.view(1, -1))
+
+    def _step_triton(self) -> None:
+        from .kernels import lif_update_kernel, propagate_kernel
+
+        p = self.p
+        self.hist_pos.copy_(torch.remainder(self.hist_pos + 1, self.hist_len))
+        self.g_inc.zero_()
+        propagate_kernel[(self.n,)](
+            self.hist,
+            self.hist_pos,
+            self.rowptr,
+            self.col,
+            self.val,
+            self.g_inc,
+            self.n,
+            self.delay_steps,
+            self.hist_len,
+            BLOCK=128,
+        )
+        self.seed.add_(1)
+        block = 1024
+        lif_update_kernel[((self.n + block - 1) // block,)](
+            self.v,
+            self.g,
+            self.refr,
+            self.g_inc,
+            self.stim_prob,
+            self.refr_len,
+            self.spikes,
+            self.hist,
+            self.hist_pos,
+            self.seed,
+            self.n,
+            self.decay_m,
+            self.decay_s,
+            p.v_rest,
+            p.v_th,
+            p.v_reset,
+            BLOCK=block,
+        )
+
+    def _step_impl(self) -> None:
+        if self.backend == "triton":
+            self._step_triton()
+        else:
+            self._step_torch()
 
     def step(self) -> torch.Tensor:
-        """Advance one time step. Returns the bool spike vector (device tensor)."""
+        """Advance one time step. Returns the (N,) float32 spike vector (device tensor)."""
         if self._graph is not None:
             self._graph.replay()
         else:
@@ -151,7 +232,7 @@ class LIFBrain:
         """Capture :meth:`step` into a CUDA graph (removes Python launch overhead)."""
         if self.device.type != "cuda":
             return
-        # Warm-up on a side stream as recommended by the PyTorch docs.
+        # Warm-up on a side stream as recommended by the PyTorch docs (also JIT-compiles Triton).
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -196,7 +277,7 @@ class LIFBrain:
                 rec_buf.append(s[rec_idx].clone())
         events: list[tuple[int, float]] = []
         if rec_idx is not None and rec_buf:
-            m = torch.stack(rec_buf).cpu().numpy()  # (steps, len(rec_idx))
+            m = torch.stack(rec_buf).cpu().numpy() > 0  # (steps, len(rec_idx))
             t_idx, n_idx = np.nonzero(m)
             rec_np = rec_idx.cpu().numpy()
             events = [(int(rec_np[j]), float((t0 + i) * self.p.dt)) for i, j in zip(t_idx, n_idx)]

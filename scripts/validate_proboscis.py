@@ -23,6 +23,7 @@ def main() -> None:
     ap.add_argument("--min-syn", type=int, default=1)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--backend", default="auto", choices=["auto", "triton", "torch"])
     args = ap.parse_args()
 
     cn = load_connectome(min_syn=args.min_syn)
@@ -31,7 +32,8 @@ def main() -> None:
     print(f"sugar GRNs: {len(sugar_idx)} found, {len(missing)} missing from v783")
     mn9_idx = int(cn.index_of([MN9])[0])
 
-    brain = LIFBrain(cn, device=args.device)
+    brain = LIFBrain(cn, device=args.device, backend=args.backend)
+    print(f"backend: {brain.backend}")
     brain.set_stimulus(sugar_idx, args.rate)
 
     rates = []

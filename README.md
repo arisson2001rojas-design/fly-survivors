@@ -11,10 +11,10 @@ alive in a bullet-heaven game.
 ## Status
 
 - [x] Connectome loader (FlyWire v783, via the files of Shiu et al. 2024)
-- [x] LIF whole-brain simulator in PyTorch, CUDA-graph captured, all synapses
-- [x] Validation: sugar-sensing neurons -> proboscis motor neuron MN9 fires
-      (~112 Hz, ~400 active neurons, matching the reference model)
-- [ ] Real-time speed (currently 0.27x with all synapses, 0.7x with >= 5 synapses per pair)
+- [x] LIF whole-brain simulator, all 15 M synapses, PyTorch + Triton, CUDA-graph captured
+- [x] Validation against the original Brian2 model: sugar-sensing neurons -> proboscis
+      motor neuron MN9 at 90 Hz (reference: 88 Hz), ~400 active neurons, same top neurons
+- [x] Real time: 80 us per 0.1 ms step on an RTX 4080 SUPER (1.2x real time)
 - [ ] Virtual eye: screen capture -> polar warp -> photoreceptor columns
 - [ ] Motor readout: descending neurons -> virtual gamepad
 - [ ] Vampire Survivors integration (dxcam + vgamepad), level-up menu handling
@@ -26,6 +26,7 @@ alive in a bullet-heaven game.
 python -m venv .venv
 .venv\Scripts\activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install triton-windows                # Triton on Windows (Linux: pip install triton)
 pip install -e .[dev]
 python scripts/download_data.py        # ~105 MB, once
 python scripts/validate_proboscis.py   # sugar GRNs -> MN9
@@ -49,14 +50,32 @@ Excitatory / inhibitory sign comes from the predicted neurotransmitter of the
 presynaptic neuron (GABA and glutamate inhibitory). "Optogenetic" activation of a set
 of neurons is Poisson spiking at a chosen rate, as in the reference.
 
+One detail that matters: in the Brian2 reference, synaptic input arriving while a
+neuron is refractory is dropped, not accumulated. Accumulating it makes the whole
+network ~25% more excitable (MN9 at 112 Hz instead of 88 Hz). This model drops it too.
+
 `scripts/reference_brian2.py` runs the original Brian2 model on the same experiment
 (slow, CPU) to compare numbers.
+
+### Speed
+
+| Backend | Propagation | us / step | real time |
+|---|---|---|---|
+| torch | CSR sparse mat-vec over all 15 M edges | 376 | 0.27x |
+| triton | event-driven, only out-edges of neurons that spiked | 80 | 1.2x |
+
+Only a few dozen neurons spike per 0.1 ms step, so touching all edges every step is
+wasted work. The Triton kernel launches one program per presynaptic neuron; programs
+whose neuron is silent exit immediately. A second fused kernel does the LIF update,
+Poisson forcing and the delay ring-buffer write. The whole step is replayed as one
+CUDA graph. Triton on Windows comes from the `triton-windows` package.
 
 ## Layout
 
 ```
 src/flysurvivors/connectome.py   load + cache the edge list, id <-> index mapping
-src/flysurvivors/lif.py          LIFBrain: GPU state, step(), CUDA graph capture, run()
+src/flysurvivors/lif.py          LIFBrain: state, torch reference step, CUDA graph capture, run()
+src/flysurvivors/kernels.py      Triton kernels: event-driven propagation + fused LIF update
 src/flysurvivors/neurons.py      known root ids (sugar GRNs, MN9, later: eye + descending neurons)
 scripts/                         download, validation, benchmark, reference
 tests/                           tiny synthetic networks checking delay, refractory, summation

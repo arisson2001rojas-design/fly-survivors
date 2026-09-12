@@ -84,9 +84,52 @@ def test_synaptic_delay():
 
 
 def test_refractory_caps_rate():
-    cn = make_cn([(0, 1, 500)])  # huge input keeps neuron 1 above threshold
+    cn = make_cn([(0, 1, 500)])  # every input spike alone crosses threshold
     brain = LIFBrain(cn, device="cpu")
     brain.set_stimulus([0], 1000.0)
     counts = run_counts(brain, 1000)
-    # refractory 2.2 ms + 1 step -> at most ~435 Hz
-    assert 300 < counts[1] <= 1000 / 2.3 + 1
+    # Refractory 2.2 ms + 1 step caps the rate at ~435 Hz; inputs arriving while
+    # refractory are dropped, so the neuron then waits ~1 ms for the next input.
+    assert 150 < counts[1] <= 1000 / 2.3 + 1
+
+
+def test_input_during_refractory_is_dropped():
+    # Two strong inputs 1 ms apart: the second lands during the refractory period
+    # opened by the first and must not produce a second spike (Brian2 semantics).
+    cn = make_cn([(0, 1, 6000)])
+    brain = LIFBrain(cn, device="cpu")
+    brain.refr_len[0] = 0
+    spikes = []
+    for k in range(80):
+        brain.stim_prob[0] = 1.0 if k in (0, 10) else 0.0
+        if brain.step()[1] > 0:
+            spikes.append(k * 0.1)
+    assert spikes == [pytest.approx(1.9)]
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="needs CUDA"
+)
+def test_triton_matches_torch_on_full_brain():
+    """Both backends must agree on a deterministic drive (Poisson prob = 1 every step)."""
+    import torch
+
+    from flysurvivors import load_connectome
+    from flysurvivors.kernels import HAS_TRITON
+    from flysurvivors.neurons import SUGAR_GRN_RIGHT
+
+    if not HAS_TRITON:
+        pytest.skip("needs Triton")
+    cn = load_connectome()
+    idx, _ = cn.index_of_existing(SUGAR_GRN_RIGHT)
+    counts = {}
+    for backend in ("torch", "triton"):
+        brain = LIFBrain(cn, device="cuda", backend=backend)
+        brain.set_stimulus(idx, 10_000.0)  # prob = 1.0 per step -> deterministic
+        counts[backend], _ = brain.run(200.0)
+        torch.cuda.synchronize()
+    a, b = counts["torch"], counts["triton"]
+    assert a.sum() > 1000
+    # Float atomics reorder sums, and the network is chaotic, so a few threshold flips
+    # cascade: measured ~1% of spikes differ under this extreme drive. Catch real bugs only.
+    assert np.abs(a - b).sum() <= 0.03 * a.sum()

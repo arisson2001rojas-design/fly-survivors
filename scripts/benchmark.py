@@ -14,11 +14,13 @@ def main() -> None:
     ap.add_argument("--min-syn", type=int, default=1)
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--backend", default="auto", choices=["auto", "triton", "torch"])
     args = ap.parse_args()
 
     cn = load_connectome(min_syn=args.min_syn)
     print(cn.summary())
-    brain = LIFBrain(cn, device=args.device)
+    brain = LIFBrain(cn, device=args.device, backend=args.backend)
+    print(f"backend: {brain.backend}")
     idx, _ = cn.index_of_existing(SUGAR_GRN_RIGHT)
     brain.set_stimulus(idx, 200.0)
 
