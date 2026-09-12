@@ -24,10 +24,14 @@ game = [
     "opencv-python",
     "pygame",
 ]
-dev = ["pytest"]
+viz = ["matplotlib"]
+dev = ["pytest", "matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+flysurvivors = ["resources/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -135,7 +135,7 @@ class LIFBrain:
 
     def set_stimulus(self, idx, rate_hz: float) -> None:
         """Drive neurons ``idx`` (model indices) with Poisson spikes at ``rate_hz``."""
-        idx = torch.as_tensor(np.asarray(idx, dtype=np.int64), device=self.device)
+        idx = torch.as_tensor(np.array(idx, dtype=np.int64), device=self.device)
         self.stim_prob[idx] = rate_hz * self.p.dt / 1000.0
         self.refr_len[idx] = 0
 
@@ -246,6 +246,18 @@ class LIFBrain:
         self.reset()
 
     # -------------------------------------------------------------------- run
+    def run_steps(self, n_steps: int, idx: torch.Tensor | None = None) -> torch.Tensor:
+        """Advance ``n_steps`` and return spike counts (device tensor) for ``idx``
+        (all neurons if None). Meant for the real-time loop: no host sync."""
+        if self.device.type == "cuda" and self._graph is None:
+            self.capture_graph()
+        n = self.n if idx is None else len(idx)
+        counts = torch.zeros(n, dtype=torch.float32, device=self.device)
+        for _ in range(n_steps):
+            s = self.step()
+            counts += s if idx is None else s.index_select(0, idx)
+        return counts
+
     def run(
         self,
         t_ms: float,
