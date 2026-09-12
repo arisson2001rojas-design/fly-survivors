@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flysurvivors"
+version = "0.1.0"
+description = "A whole-brain Drosophila connectome simulation (FlyWire v783, LIF) that plays Vampire Survivors"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "scipy>=1.11",
+    "torch>=2.4",
+]
+
+[project.optional-dependencies]
+game = [
+    "dxcam",
+    "vgamepad",
+    "opencv-python",
+    "pygame",
+]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
