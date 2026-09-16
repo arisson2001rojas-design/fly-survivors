@@ -56,6 +56,30 @@ if HAS_TRITON:
                 tl.atomic_add(out_ptr + cols, vals, mask=mask)
 
     @triton.jit
+    def propagate_grouped_kernel(
+        hist_ptr, pos_ptr, rowptr_ptr, col_ptr, val_ptr, out_ptr,
+        n: tl.constexpr, delay_steps: tl.constexpr, hist_len: tl.constexpr,
+        BLOCK: tl.constexpr, GROUP: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        base = pid * GROUP
+        pos = tl.load(pos_ptr)
+        read_row = (pos - delay_steps + hist_len) % hist_len
+        for j in tl.static_range(0, GROUP):
+            nid = base + j
+            if nid < n:
+                s = tl.load(hist_ptr + read_row * n + nid)
+                if s != 0.0:
+                    start = tl.load(rowptr_ptr + nid)
+                    end = tl.load(rowptr_ptr + nid + 1)
+                    for off in range(start, end, BLOCK):
+                        idx = off + tl.arange(0, BLOCK)
+                        mask = idx < end
+                        cols = tl.load(col_ptr + idx, mask=mask, other=0)
+                        vals = tl.load(val_ptr + idx, mask=mask, other=0.0)
+                        tl.atomic_add(out_ptr + cols, vals, mask=mask)
+
+    @triton.jit
     def lif_update_kernel(
         v_ptr,
         g_ptr,

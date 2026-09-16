@@ -126,7 +126,7 @@ def test_triton_matches_torch_on_full_brain():
     for backend in ("torch", "triton"):
         brain = LIFBrain(cn, device="cuda", backend=backend)
         brain.set_stimulus(idx, 10_000.0)  # prob = 1.0 per step -> deterministic
-        counts[backend], _ = brain.run(200.0)
+        counts[backend], _ = brain.run(200.0, use_graph=False)
         torch.cuda.synchronize()
     a, b = counts["torch"], counts["triton"]
     assert a.sum() > 1000

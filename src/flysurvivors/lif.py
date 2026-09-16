@@ -174,12 +174,12 @@ class LIFBrain:
         self.hist.index_copy_(0, self.hist_pos.view(1), self.spikes.view(1, -1))
 
     def _step_triton(self) -> None:
-        from .kernels import lif_update_kernel, propagate_kernel
+        from .kernels import lif_update_kernel, propagate_grouped_kernel
 
         p = self.p
         self.hist_pos.copy_(torch.remainder(self.hist_pos + 1, self.hist_len))
         self.g_inc.zero_()
-        propagate_kernel[(self.n,)](
+        propagate_grouped_kernel[((self.n + 7) // 8,)](
             self.hist,
             self.hist_pos,
             self.rowptr,
@@ -190,6 +190,7 @@ class LIFBrain:
             self.delay_steps,
             self.hist_len,
             BLOCK=128,
+            GROUP=8,
         )
         self.seed.add_(1)
         block = 1024
