@@ -99,7 +99,11 @@ class VirtualEye:
     def encode(self, crop: np.ndarray, heading_deg: float = 0.0) -> np.ndarray:
         """Per-column intensity in [0, 1] from a player-centred grayscale crop in [0, 1]."""
         img = self.to_fly_frame(np.asarray(crop, dtype=np.float32), heading_deg)
-        out = self.M @ img.ravel()
+        return self.encode_fly_frame(img)
+
+    def encode_fly_frame(self, img: np.ndarray) -> np.ndarray:
+        """Same as :meth:`encode` for a crop already in the fly's frame."""
+        out = self.M @ np.asarray(img, dtype=np.float32).ravel()
         out[~self.sees_ground] = self.p.sky
         return out.astype(np.float32)
 
@@ -108,7 +112,10 @@ class VirtualEye:
 class DriveParams:
     rate_max_hz: float = 150.0  # input rate at full drive
     relative: bool = True  # encode contrast relative to the mean of the visible scene
-    contrast_scale: float = 0.4  # intensity difference that saturates the drive
+    contrast_scale: float = 0.4  # intensity difference that saturates the drive (if not adaptive)
+    adaptive: bool = True  # scale by the scene's spread instead: saturate at k_std standard deviations
+    k_std: float = 2.0
+    min_std: float = 0.03
     tonic_gain: float = 1.0  # weight of the instantaneous (relative) intensity
     phasic_gain: float = 0.0  # weight of (intensity - slow average): temporal contrast
     baseline: float = 0.0  # added drive, in [0, 1]
@@ -163,8 +170,12 @@ class RetinaDrive:
         (positive = brighter than the adapted level for phasic gain, or plain intensity)."""
         p = self.p
         if p.relative:
-            mean = float(intensity[self.active].mean()) if self.active.any() else 0.0
-            signal = (intensity - mean) / p.contrast_scale  # >0 brighter, <0 darker
+            vis = intensity[self.active] if self.active.any() else intensity
+            mean = float(vis.mean())
+            scale = p.contrast_scale
+            if p.adaptive:
+                scale = max(float(vis.std()), p.min_std) * p.k_std
+            signal = (intensity - mean) / scale  # >0 brighter, <0 darker
         else:
             signal = intensity * 2 - 1
         if self.slow is None:

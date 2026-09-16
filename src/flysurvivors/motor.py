@@ -96,6 +96,8 @@ class MotorReadout:
 @dataclass
 class LocomotionParams:
     turn_gain: float = 4.0  # deg/s of heading change per Hz of (DNa02_R - DNa02_L)
+    max_turn_deg_s: float = 360.0  # cap on the turning rate
+    baseline_speed: float = 0.0  # the fly keeps walking at this speed; the brain steers
     forward_gain: float = 0.02  # speed units per Hz of DNp09
     backward_gain: float = 0.02  # speed units per Hz of MDN
     escape_threshold: float = 5.0  # Hz on the giant fiber
@@ -117,15 +119,16 @@ class Locomotion:
     def update(self, rates: dict[str, float], dt_ms: float) -> tuple[float, float]:
         p = self.params
         turn = (rates.get("DNa02_R", 0.0) - rates.get("DNa02_L", 0.0)) * p.turn_gain
+        turn = float(np.clip(turn, -p.max_turn_deg_s, p.max_turn_deg_s))
         self.heading_deg = (self.heading_deg + turn * dt_ms / 1000.0) % 360.0
 
         if rates.get("GF", 0.0) > p.escape_threshold and self._escape_left_ms <= 0:
             self._escape_left_ms = p.escape_ms
         if self._escape_left_ms > 0:
             self._escape_left_ms -= dt_ms
-            self.speed = -p.escape_speed  # jump away: backwards along the heading
+            self.speed = p.escape_speed  # jump: a dash along the current heading
         else:
-            fwd = rates.get("DNp09", 0.0) * p.forward_gain
+            fwd = p.baseline_speed + rates.get("DNp09", 0.0) * p.forward_gain
             back = rates.get("MDN", 0.0) * p.backward_gain
             self.speed = float(np.clip(fwd - back, -p.max_speed, p.max_speed))
         return self.heading_deg, self.speed

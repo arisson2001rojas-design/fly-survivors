@@ -90,7 +90,7 @@ def test_locomotion_turns_right_when_right_dna02_leads():
 def test_locomotion_escape_burst():
     loco = Locomotion(LocomotionParams(escape_threshold=5.0, escape_ms=100.0))
     _, s = loco.update({"GF": 20.0, "DNp09": 50.0}, dt_ms=16.0)
-    assert s == pytest.approx(-loco.params.escape_speed)
+    assert s == pytest.approx(loco.params.escape_speed)
     for _ in range(10):
         _, s = loco.update({"GF": 0.0, "DNp09": 50.0}, dt_ms=16.0)
     assert s > 0
